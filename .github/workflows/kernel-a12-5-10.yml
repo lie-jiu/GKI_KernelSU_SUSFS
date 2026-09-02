@@ -7,6 +7,11 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
+      target_versions:
+        description: "要编译的 5.10 子版本（all 或留空=全部；支持 236 / 5.10.236 / 5.10.236,5.10.240）"
+        required: false
+        type: string
+        default: "all"
       kernelsu_variant:
         description: "KernelSU 变体"
         required: true
@@ -87,6 +92,11 @@ on:
         default: false
   workflow_call:
     inputs:
+      target_versions:
+        description: "要编译的 5.10 子版本（all 或留空=全部；支持 236 / 5.10.236 / 5.10.236,5.10.240）"
+        required: false
+        type: string
+        default: "all"
       kernelsu_variant:
         required: true
         type: string
@@ -136,78 +146,114 @@ on:
         default: false
 
 jobs:
+  # 根据 target_versions 输入筛选出真正需要构建的版本，避免编译全部 22 个子版本
+  setup-matrix:
+    name: 解析构建目标
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      summary: ${{ steps.gen.outputs.summary }}
+    steps:
+      - name: 生成 5.10 构建矩阵
+        id: gen
+        env:
+          TARGETS: ${{ inputs.target_versions || 'all' }}
+        run: |
+          set -euo pipefail
+
+          # 5.10 全部可用版本（此处为唯一数据源）
+          # 格式: sub_level|os_patch_level|revision
+          VERSIONS=(
+            "66|2022-01|r11"
+            "81|2022-03|r11"
+            "101|2022-04|r28"
+            "110|2022-07|r1"
+            "117|2022-09|r1"
+            "136|2022-11|r15"
+            "149|2023-01|r1"
+            "160|2023-03|r1"
+            "168|2023-04|r9"
+            "177|2023-07|r3"
+            "185|2023-09|r1"
+            "198|2024-01|r17"
+            "205|2024-03|r1"
+            "209|2024-05|r13"
+            "218|2024-08|r14"
+            "226|2024-11|r8"
+            "233|2025-02|r1"
+            "236|2025-05|r1"
+            "237|2025-06|r1"
+            "240|2025-09|r1"
+            "246|2025-12|r1"
+            "X|lts|r1"
+          )
+
+          raw="$(printf '%s' "${TARGETS:-all}" | tr -d '[:space:]')"
+          [ -z "$raw" ] && raw="all"
+
+          is_all=0
+          wanted=()
+          case "$raw" in
+            all|ALL|All|'*')
+              is_all=1
+              ;;
+            *)
+              IFS=',' read -r -a parts <<< "$raw"
+              for p in "${parts[@]}"; do
+                [ -z "$p" ] && continue
+                p="${p#android12-5.10.}"
+                p="${p#5.10.}"
+                p="${p#5.10-}"
+                p="${p#v}"
+                wanted+=("$p")
+              done
+              ;;
+          esac
+
+          include="[]"
+          labels=""
+          for v in "${VERSIONS[@]}"; do
+            IFS='|' read -r sub patch rev <<< "$v"
+            hit=0
+            if [ "$is_all" -eq 1 ]; then
+              hit=1
+            else
+              for w in ${wanted[@]+"${wanted[@]}"}; do
+                if [ "$w" = "$sub" ]; then
+                  hit=1
+                  break
+                fi
+              done
+            fi
+            if [ "$hit" -eq 1 ]; then
+              include="$(jq -c -n --argjson a "$include" --arg s "$sub" --arg p "$patch" --arg r "$rev" \
+                '$a + [{"sub_level": $s, "os_patch_level": $p, "revision": $r}]')"
+              labels="${labels:+$labels, }5.10.${sub}-${patch}"
+            fi
+          done
+
+          if [ "$include" = "[]" ]; then
+            avail="$(printf '%s\n' "${VERSIONS[@]}" | cut -d'|' -f1 | paste -sd, -)"
+            echo "::error::未匹配到任何 5.10 内核版本（输入: ${raw}）。可选值: all 或 ${avail}"
+            exit 1
+          fi
+
+          matrix="$(jq -c -n --argjson i "$include" '{include: $i}')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "summary=$labels" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 5.10 构建目标"
+            echo ""
+            echo "- 输入: \`${raw}\`"
+            echo "- 将构建: ${labels}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build-kernels-a12-5-10:
+    needs: setup-matrix
     name: "5.10.${{ matrix.sub_level }}-${{ matrix.os_patch_level }}"
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - sub_level: "66"
-            os_patch_level: "2022-01"
-            revision: "r11"
-          - sub_level: "81"
-            os_patch_level: "2022-03"
-            revision: "r11"
-          - sub_level: "101"
-            os_patch_level: "2022-04"
-            revision: "r28"
-          - sub_level: "110"
-            os_patch_level: "2022-07"
-            revision: "r1"
-          - sub_level: "117"
-            os_patch_level: "2022-09"
-            revision: "r1"
-          - sub_level: "136"
-            os_patch_level: "2022-11"
-            revision: "r15"
-          - sub_level: "149"
-            os_patch_level: "2023-01"
-            revision: "r1"
-          - sub_level: "160"
-            os_patch_level: "2023-03"
-            revision: "r1"
-          - sub_level: "168"
-            os_patch_level: "2023-04"
-            revision: "r9"
-          - sub_level: "177"
-            os_patch_level: "2023-07"
-            revision: "r3"
-          - sub_level: "185"
-            os_patch_level: "2023-09"
-            revision: "r1"
-          - sub_level: "198"
-            os_patch_level: "2024-01"
-            revision: "r17"
-          - sub_level: "205"
-            os_patch_level: "2024-03"
-            revision: "r1"
-          - sub_level: "209"
-            os_patch_level: "2024-05"
-            revision: "r13"
-          - sub_level: "218"
-            os_patch_level: "2024-08"
-            revision: "r14"
-          - sub_level: "226"
-            os_patch_level: "2024-11"
-            revision: "r8"
-          - sub_level: "233"
-            os_patch_level: "2025-02"
-            revision: "r1"
-          - sub_level: "236"
-            os_patch_level: "2025-05"
-            revision: "r1"
-          - sub_level: "237"
-            os_patch_level: "2025-06"
-            revision: "r1"
-          - sub_level: "240"
-            os_patch_level: "2025-09"
-            revision: "r1"
-          - sub_level: "246"
-            os_patch_level: "2025-12"
-            revision: "r1"
-          - sub_level: "X"
-            os_patch_level: "lts"
-            revision: "r1"
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
     uses: ./.github/workflows/build.yml
     secrets: inherit
     with:
