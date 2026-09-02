@@ -7,6 +7,15 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
+      release_type:
+        description: "发布类型（Actions=仅上传 Actions 产物，不创建 Release）"
+        required: true
+        type: choice
+        options:
+          - Actions
+          - Pre-Release
+          - Release
+        default: Actions
       target_versions:
         description: "要编译的 5.10 子版本（all 或留空=全部；支持 236 / 5.10.236 / 5.10.236,5.10.240）"
         required: false
@@ -92,6 +101,11 @@ on:
         default: false
   workflow_call:
     inputs:
+      release_type:
+        description: "发布类型（main.yml 调用时固定为 Actions，由 main.yml 统一发布）"
+        required: false
+        type: string
+        default: "Actions"
       target_versions:
         description: "要编译的 5.10 子版本（all 或留空=全部；支持 236 / 5.10.236 / 5.10.236,5.10.240）"
         required: false
@@ -283,3 +297,375 @@ jobs:
     secrets: inherit
     with:
       kernelsu_variant: ${{ inputs.kernelsu_variant }}
+
+  # ==================== 创建 GitHub Release ====================
+  # 仅在直接触发本工作流且 release_type 不为 Actions 时发布
+  # 从 main.yml 调用时不发布，由 main.yml 统一创建 Release
+  release:
+    name: 发布 Release (Android 12 / 5.10)
+    if: ${{ always() && !cancelled() && !inputs.called_from_main && inputs.release_type != 'Actions' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    needs:
+      - setup-matrix
+      - build-kernels-a12-5-10
+      - get-ksu-manager
+
+    env:
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 以下变量用于发布说明中展示本次构建配置
+      RELEASE_TYPE: ${{ inputs.release_type }}
+      KSU_VARIANT: ${{ inputs.kernelsu_variant }}
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_BUILD_TIME: ${{ inputs.build_time }}
+      USE_ZRAM: ${{ inputs.use_zram }}
+      USE_BBG: ${{ inputs.use_bbg }}
+      USE_KPM: ${{ inputs.use_kpm }}
+      USE_REKERNEL: ${{ inputs.use_rekernel }}
+      CVE_PATCH: ${{ inputs.cve_2026_43499_patch }}
+      CANCEL_SUSFS: ${{ inputs.cancel_susfs }}
+      DROIDSPACES: ${{ inputs.droidspaces }}
+      DROIDSPACES_NTSYNC: ${{ inputs.droidspaces_ntsync }}
+      ARTIFACT_UPLOAD_MODE: ${{ inputs.artifact_upload_mode }}
+      TARGETS_SUMMARY: ${{ needs.setup-matrix.outputs.summary }}
+      TAG_PREFIX: "a12-5.10"
+
+    steps:
+      # ==================== 检出代码 ====================
+      - name: 检出代码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      # ==================== 设置显示名称 ====================
+      # 预计算发布说明中的各项显示值
+      - name: 设置显示名称
+        run: |
+          case "$KSU_VARIANT" in
+            "Next")          KSU_NAME="KernelSU-Next" ;;
+            "Official")      KSU_NAME="KernelSU" ;;
+            "SukiSU")        KSU_NAME="SukiSU" ;;
+            "SukiSU(40726)") KSU_NAME="SukiSU (40726)" ;;
+            "SukiSU(40548)") KSU_NAME="SukiSU (40548)" ;;
+            "ReSukiSU")      KSU_NAME="ReSukiSU" ;;
+            *)               KSU_NAME="$KSU_VARIANT" ;;
+          esac
+          echo "KSU_NAME=$KSU_NAME" >> $GITHUB_ENV
+
+          KSU_VER="${{ needs.get-ksu-manager.outputs.ksuVer }}"
+          SUS_VER="${{ needs.get-ksu-manager.outputs.susVer }}"
+          if [ -z "$KSU_VER" ]; then KSU_VER="unknown"; fi
+          if [ -z "$SUS_VER" ]; then SUS_VER="1.0.0"; fi
+          echo "KSU_VER=$KSU_VER" >> $GITHUB_ENV
+          echo "SUS_VER=$SUS_VER" >> $GITHUB_ENV
+
+          # 功能开关显示
+          if [ "$USE_ZRAM" = "true" ]; then LZ4_STATUS="开启"; else LZ4_STATUS="未开启"; fi
+          if [ "$USE_BBG" = "true" ]; then BBG_STATUS="支持"; else BBG_STATUS="不支持"; fi
+          if [ "$USE_REKERNEL" = "true" ]; then REKERNEL_STATUS="启用"; else REKERNEL_STATUS="未启用"; fi
+          if [ "$CVE_PATCH" = "true" ]; then CVE_STATUS="已应用"; else CVE_STATUS="未应用"; fi
+          case "$USE_KPM" in
+            enabled*) KPM_STATUS="支持" ;;
+            patched*) KPM_STATUS="支持（补丁尚不支持）" ;;
+            *)        KPM_STATUS="未开启" ;;
+          esac
+          if [ "$CANCEL_SUSFS" = "true" ]; then SUSFS_STATUS="关闭"; else SUSFS_STATUS="开启"; fi
+
+          if [ -z "$DROIDSPACES" ] || [ "$DROIDSPACES" = "off" ]; then
+            DROIDSPACES_STATUS="未启用"
+          else
+            DROIDSPACES_STATUS="槽位 $DROIDSPACES"
+          fi
+          if [ "$DROIDSPACES_NTSYNC" = "true" ]; then NTSYNC_STATUS="开启"; else NTSYNC_STATUS="未开启"; fi
+
+          # Hook / 挂载方式
+          case "$KSU_VARIANT" in
+            SukiSU*|ReSukiSU) HOOK_TYPE="SUSFS Inline Hooks" ;;
+            *)                HOOK_TYPE="KPROBE Hooks" ;;
+          esac
+          if [ "$KSU_VARIANT" = "Official" ]; then MOUNT_TYPE="OVERLAYFS"; else MOUNT_TYPE="Magic Mount"; fi
+
+          # 自定义版本名 / 构建时间
+          if [ -n "$INPUT_VERSION" ]; then VERSION_STATUS="$INPUT_VERSION"; else VERSION_STATUS="默认"; fi
+          if [ -n "$INPUT_BUILD_TIME" ]; then BUILD_TIME_STATUS="$INPUT_BUILD_TIME"; else BUILD_TIME_STATUS="构建时 UTC 当前时间"; fi
+
+          {
+            echo "LZ4_STATUS=$LZ4_STATUS"
+            echo "BBG_STATUS=$BBG_STATUS"
+            echo "REKERNEL_STATUS=$REKERNEL_STATUS"
+            echo "CVE_STATUS=$CVE_STATUS"
+            echo "KPM_STATUS=$KPM_STATUS"
+            echo "SUSFS_STATUS=$SUSFS_STATUS"
+            echo "DROIDSPACES_STATUS=$DROIDSPACES_STATUS"
+            echo "NTSYNC_STATUS=$NTSYNC_STATUS"
+            echo "HOOK_TYPE=$HOOK_TYPE"
+            echo "MOUNT_TYPE=$MOUNT_TYPE"
+            echo "VERSION_STATUS=$VERSION_STATUS"
+            echo "BUILD_TIME_STATUS=$BUILD_TIME_STATUS"
+          } >> $GITHUB_ENV
+
+          if [ "$SUSFS_STATUS" = "开启" ]; then
+            echo "RELEASE_NAME=GKI Kernel (Android 12 / 5.10): ${KSU_NAME} ${KSU_VER} + SUSFS ${SUS_VER}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_NAME=GKI Kernel (Android 12 / 5.10): ${KSU_NAME} ${KSU_VER}" >> $GITHUB_ENV
+          fi
+
+      # ==================== 验证构建状态 ====================
+      # 确保矩阵解析与内核构建全部成功，否则不发布
+      - name: 验证构建状态
+        run: |
+          failed=0
+          if [ "${{ needs.setup-matrix.result }}" != "success" ]; then
+            echo "::error::矩阵解析未成功 (结果: ${{ needs.setup-matrix.result }})"
+            failed=1
+          fi
+          if [ "${{ needs.build-kernels-a12-5-10.result }}" != "success" ]; then
+            echo "::error::内核构建未全部成功 (结果: ${{ needs.build-kernels-a12-5-10.result }})"
+            failed=1
+          fi
+          if [ "$failed" -ne 0 ]; then exit 1; fi
+          echo "构建状态检查通过"
+
+      # ==================== 获取 KernelSU 提交信息 ====================
+      - name: 获取 KernelSU 提交信息
+        run: |
+          case "$KSU_VARIANT" in
+            "Official") REPO_URL="https://github.com/tiann/KernelSU.git"; REPO_URL2="tiann/KernelSU" ;;
+            "Next") REPO_URL="https://github.com/KernelSU-Next/KernelSU-Next.git"; REPO_URL2="KernelSU-Next/KernelSU-Next" ;;
+            "SukiSU"|"SukiSU(40726)"|"SukiSU(40548)") REPO_URL="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"; REPO_URL2="SukiSU-Ultra/SukiSU-Ultra" ;;
+            "ReSukiSU") REPO_URL="https://github.com/ReSukiSU/ReSukiSU.git"; REPO_URL2="ReSukiSU/ReSukiSU" ;;
+            *) REPO_URL=""; REPO_URL2="" ;;
+          esac
+
+          # 确定分支
+          case "$KSU_VARIANT" in
+            "Official") BRANCH="main" ;;
+            "SukiSU"|"SukiSU(40726)"|"SukiSU(40548)")
+              if [ "$CANCEL_SUSFS" = "true" ]; then BRANCH="main"; else BRANCH="builtin"; fi ;;
+            "ReSukiSU") BRANCH="main" ;;
+            "Next") BRANCH="dev" ;;
+            *) BRANCH="main" ;;
+          esac
+          echo "BRANCH_INFO=$BRANCH" >> $GITHUB_ENV
+
+          KSU_REF=""
+          KSU_URL=""
+          # SukiSU 支持从 config/config 指定自定义提交
+          if [ "$KSU_VARIANT" = "SukiSU" ] && [ -f "config/config" ]; then
+            CUSTOM_ENABLED=$(grep "^custom=" config/config | cut -d'=' -f2)
+            CUSTOM_COMMIT=$(grep "^sukisu=" config/config | cut -d'=' -f2)
+            if [ "$CUSTOM_ENABLED" = "true" ] && [ -n "$CUSTOM_COMMIT" ]; then
+              KSU_REF="$CUSTOM_COMMIT"
+              KSU_URL="https://github.com/$REPO_URL2/commit/$CUSTOM_COMMIT"
+              echo "BRANCH_INFO=custom" >> $GITHUB_ENV
+            fi
+          fi
+
+          if [ -z "$KSU_REF" ] && [ -n "$REPO_URL" ]; then
+            COMMIT_HASH=$(git ls-remote "$REPO_URL" "refs/heads/${BRANCH}" | awk '{ print $1 }')
+            if [ -n "$COMMIT_HASH" ]; then
+              KSU_REF="$COMMIT_HASH"
+              KSU_URL="https://github.com/$REPO_URL2/commit/$COMMIT_HASH"
+            fi
+          fi
+
+          echo "KSU_URL=$KSU_URL" >> $GITHUB_ENV
+          if [[ "$KSU_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "KSU_DISPLAY_REF=${KSU_REF:0:7}" >> $GITHUB_ENV
+          else
+            echo "KSU_DISPLAY_REF=${KSU_REF:-unknown}" >> $GITHUB_ENV
+          fi
+
+      # ==================== 获取 SUSFS 提交信息 ====================
+      - name: 获取 SUSFS 提交信息
+        run: |
+          SUSFS_BRANCH="gki-android12-5.10"
+          echo "SUSFS_BRANCH_NAME=$SUSFS_BRANCH" >> $GITHUB_ENV
+          COMMIT_HASH=$(git ls-remote https://gitlab.com/simonpunk/susfs4ksu.git "refs/heads/$SUSFS_BRANCH" | awk '{ print $1 }')
+          if [ -n "$COMMIT_HASH" ]; then
+            echo "SUSFS_URL=https://gitlab.com/simonpunk/susfs4ksu/-/commit/$COMMIT_HASH" >> $GITHUB_ENV
+            echo "SUSFS_DISPLAY_REF=${COMMIT_HASH:0:7}" >> $GITHUB_ENV
+          else
+            echo "SUSFS_URL=" >> $GITHUB_ENV
+            echo "SUSFS_DISPLAY_REF=unknown" >> $GITHUB_ENV
+          fi
+
+      # ==================== 生成发布说明 ====================
+      - name: 生成发布说明
+        run: |
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          if [ -n "$SUSFS_URL" ]; then
+            SUSFS_COMMIT_LINE="- SUSFS4KSU (\`$SUSFS_BRANCH_NAME\`): [\`$SUSFS_DISPLAY_REF\`]($SUSFS_URL)"
+          else
+            SUSFS_COMMIT_LINE="- 未获取到 SUSFS 提交信息"
+          fi
+
+          cat > release_body.md << EOF
+          ## GKI Kernel Release — Android 12 / 5.10
+
+          **$KSU_NAME $KSU_VER** + **SUSFS $SUS_VER**
+
+          | 项目 | 内容 |
+          |:---|:---|
+          | 发布类型 | $RELEASE_TYPE |
+          | 发布时间 | $BUILD_DATE |
+          | 构建范围 | Android 12 / 5.10 |
+          | 本次编译版本 | $TARGETS_SUMMARY |
+
+          ### 构建配置
+
+          | 项目 | 内容 |
+          |:---|:---|
+          | KernelSU 变体 | $KSU_NAME |
+          | KernelSU 分支 | $BRANCH_INFO |
+          | SUSFS | $SUSFS_STATUS |
+          | Hook 类型 | $HOOK_TYPE |
+          | 挂载方式 | $MOUNT_TYPE |
+          | LTO | thin |
+          | 自定义版本名 | $VERSION_STATUS |
+          | 构建时间 | $BUILD_TIME_STATUS |
+          | BBG 安全补丁 | $BBG_STATUS |
+          | ZRAM / LZ4KD | $LZ4_STATUS |
+          | KPM | $KPM_STATUS |
+          | Droidspaces 容器 | $DROIDSPACES_STATUS |
+          | Droidspaces NTSync | $NTSYNC_STATUS |
+          | Re-Kernel 驱动 | $REKERNEL_STATUS |
+          | CVE-2026-43499 修复 | $CVE_STATUS |
+          | 产物上传模式 | $ARTIFACT_UPLOAD_MODE |
+
+          ### 下载说明
+
+          请在下方 **Assets** 中下载对应文件。
+
+          | 文件类型 | 用途 |
+          |:---|:---|
+          | \`*_kernel-*.zip\` | AnyKernel3 内核刷入包 |
+          | \`*.img\` | boot、vendor_boot 等镜像文件 |
+          | \`*.apk\` | KernelSU 管理器 |
+          | \`susfs-*.zip\` | SUSFS 配套模块 |
+
+          > [!IMPORTANT]
+          > 刷入前请备份原厂 Boot 镜像。
+          > 如果设备无法启动，请先恢复原厂镜像，再提取 KernelSU 日志进行反馈。
+
+          <details>
+          <summary>刷入后处理</summary>
+
+          ### 正常启动
+
+          安装或更新 KernelSU 管理器后，检查 root、模块和 SUSFS 状态是否正常。
+
+          ### 无法启动
+
+          1. 恢复原厂 Boot 镜像
+          2. 使用 KernelSU 管理器或 recovery 提取日志
+          3. 提交到 Issues，并附上设备型号、Android 版本、内核版本和刷入文件名
+
+          </details>
+
+          <details>
+          <summary>上游提交信息</summary>
+
+          **KernelSU**
+
+          - $KSU_NAME: [\`$KSU_DISPLAY_REF\`]($KSU_URL)
+
+          **SUSFS4KSU**
+
+          $SUSFS_COMMIT_LINE
+
+          </details>
+          EOF
+
+      # ==================== 生成版本标签 ====================
+      # 标签格式: a12-5.10-<susfs版本>-rN，独立于 main.yml 的标签命名空间
+      - name: 生成版本标签
+        run: |
+          BASE="${TAG_PREFIX}-${SUS_VER}"
+          LATEST_TAG=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null \
+            | grep -E "^${BASE}-r[0-9]+$" | head -n 1 || true)
+
+          if [ -n "$LATEST_TAG" ]; then
+            NEW_TAG=$(echo "$LATEST_TAG" | awk -F'-r' '{s=$2; if (!s) s=0; s++; printf "%s-r%d", $1, s}')
+          else
+            NEW_TAG="${BASE}-r1"
+          fi
+
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          echo "生成标签: $NEW_TAG" >> $GITHUB_STEP_SUMMARY
+
+      # ==================== 下载构建产物 ====================
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          path: ./downloaded-artifacts
+
+      # ==================== 创建 GitHub Release ====================
+      - name: 创建 GitHub Release
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "$RELEASE_TYPE" = "Pre-Release" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "$NEW_TAG" \
+            --title "$RELEASE_NAME" \
+            --notes-file release_body.md \
+            --target "$GITHUB_SHA" \
+            $PRERELEASE_FLAG
+
+      # ==================== 上传管理器和 SUSFS 模块 ====================
+      - name: 上传管理器和 SUSFS 模块
+        continue-on-error: true
+        run: |
+          echo "准备上传 APK 与 SUSFS 模块..."
+          apk_count=$(find ./downloaded-artifacts -type f -name "*.apk" | wc -l)
+          sus_count=$(find ./downloaded-artifacts -type f -path "./downloaded-artifacts/susfs-*/*" | wc -l)
+          echo "APK files: ${apk_count}"
+          echo "SUSFS files: ${sus_count}"
+          find ./downloaded-artifacts -type f -name "*.apk" -print0 | \
+          while IFS= read -r -d '' f; do
+            gh release upload "$NEW_TAG" "$f" --clobber || true
+          done
+          find ./downloaded-artifacts -type f -path "./downloaded-artifacts/susfs-*/*" -print0 | \
+          while IFS= read -r -d '' f; do
+            gh release upload "$NEW_TAG" "$f" --clobber || true
+          done
+
+      # ==================== 上传内核产物 ====================
+      - name: 上传内核产物
+        run: |
+          uploaded=0
+          for file in ./downloaded-artifacts/*_kernel-*/*; do
+            [ -e "$file" ] || continue
+            [ -d "$file" ] && continue
+            # 跳过补丁冲突汇总目录
+            [[ "$file" == *-Rejects/* ]] && continue
+            echo "上传 $file..."
+            gh release upload "$NEW_TAG" "$file" --clobber
+            uploaded=$((uploaded + 1))
+          done
+          if [ "$uploaded" -eq 0 ]; then
+            echo "::error::未找到任何内核产物，请检查构建与产物上传模式"
+            exit 1
+          fi
+          echo "共上传 $uploaded 个内核产物文件"
+          echo "- 内核产物文件数: $uploaded" >> $GITHUB_STEP_SUMMARY
+
+      # ==================== 发布摘要 ====================
+      - name: 发布摘要
+        run: |
+          {
+            echo "## Release 已创建"
+            echo ""
+            echo "- **标签**: \`$NEW_TAG\`"
+            echo "- **标题**: $RELEASE_NAME"
+            echo "- **类型**: $RELEASE_TYPE"
+            echo "- **构建版本**: $TARGETS_SUMMARY"
+            echo "- **链接**: https://github.com/$REPO_OWNER/$REPO_NAME/releases/tag/$NEW_TAG"
+          } >> $GITHUB_STEP_SUMMARY
