@@ -597,14 +597,28 @@ jobs:
       - name: 生成版本标签
         run: |
           BASE="${TAG_PREFIX}-${SUS_VER}"
-          LATEST_TAG=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null \
-            | grep -E "^${BASE}-r[0-9]+$" | head -n 1 || true)
+
+          # 必须用 tags 接口查已有标签，不能用 release list：
+          # fork 仓库的 GET /releases 列表接口会返回空数组（直接 release view 却又查得到），
+          # 用 release list 会导致永远算出 -r1，与既有 Release 撞标签 -> 创建时 403
+          LATEST_TAG=$(gh api --paginate "repos/${REPO_OWNER}/${REPO_NAME}/tags?per_page=100" \
+            --jq '.[].name' 2>/dev/null | grep -E "^${BASE}-r[0-9]+$" | head -n 1 || true)
+
+          next_tag() {
+            echo "$1" | awk -F'-r' '{s=$2; if (!s) s=0; s++; printf "%s-r%d", $1, s}'
+          }
 
           if [ -n "$LATEST_TAG" ]; then
-            NEW_TAG=$(echo "$LATEST_TAG" | awk -F'-r' '{s=$2; if (!s) s=0; s++; printf "%s-r%d", $1, s}')
+            NEW_TAG=$(next_tag "$LATEST_TAG")
           else
             NEW_TAG="${BASE}-r1"
           fi
+
+          # 兜底：确保标签未被占用，避免与既有 Release 撞车
+          while gh api "repos/${REPO_OWNER}/${REPO_NAME}/git/ref/tags/${NEW_TAG}" >/dev/null 2>&1; do
+            echo "标签 $NEW_TAG 已存在，继续递增"
+            NEW_TAG=$(next_tag "$NEW_TAG")
+          done
 
           echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
           echo "生成标签: $NEW_TAG" >> $GITHUB_STEP_SUMMARY
