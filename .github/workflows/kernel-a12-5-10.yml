@@ -62,7 +62,7 @@ on:
           - "345"
         default: "off"
       artifact_upload_mode:
-        description: "构建产物上传模式"
+        description: "构建产物上传模式（选择 Release 时会自动切换为「上传全部」，否则不会生成 AnyKernel3 刷入包）"
         required: true
         type: choice
         options:
@@ -288,7 +288,10 @@ jobs:
       enable_susfs: ${{ !inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces || 'off' }}
       droidspaces_ntsync: ${{ inputs.droidspaces_ntsync || false }}
-      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
+      # 发布 Release 时必须切到「上传全部」：build.yml 仅在该模式下才会
+      # 创建 AnyKernel3 刷入包 zip，否则上传的是未打包的 AnyKernel3 目录，
+      # Release 里会缺少可刷入的 zip（与 main.yml 的处理方式一致）
+      artifact_upload_mode: ${{ inputs.release_type != 'Actions' && '上传全部' || inputs.artifact_upload_mode }}
 
   # 仅在直接触发时运行，从 main.yml 调用时跳过
   get-ksu-manager:
@@ -392,6 +395,12 @@ jobs:
           # 自定义版本名 / 构建时间
           if [ -n "$INPUT_VERSION" ]; then VERSION_STATUS="$INPUT_VERSION"; else VERSION_STATUS="默认"; fi
           if [ -n "$INPUT_BUILD_TIME" ]; then BUILD_TIME_STATUS="$INPUT_BUILD_TIME"; else BUILD_TIME_STATUS="构建时 UTC 当前时间"; fi
+          # 发布 Release 时构建已强制切到「上传全部」，此处展示实际生效的模式
+          if [ "$RELEASE_TYPE" != "Actions" ]; then
+            UPLOAD_MODE_STATUS="上传全部（发布 Release 时自动切换）"
+          else
+            UPLOAD_MODE_STATUS="$ARTIFACT_UPLOAD_MODE"
+          fi
 
           {
             echo "LZ4_STATUS=$LZ4_STATUS"
@@ -406,6 +415,7 @@ jobs:
             echo "MOUNT_TYPE=$MOUNT_TYPE"
             echo "VERSION_STATUS=$VERSION_STATUS"
             echo "BUILD_TIME_STATUS=$BUILD_TIME_STATUS"
+            echo "UPLOAD_MODE_STATUS=$UPLOAD_MODE_STATUS"
           } >> $GITHUB_ENV
 
           if [ "$SUSFS_STATUS" = "开启" ]; then
@@ -536,7 +546,7 @@ jobs:
           | Droidspaces NTSync | $NTSYNC_STATUS |
           | Re-Kernel 驱动 | $REKERNEL_STATUS |
           | CVE-2026-43499 修复 | $CVE_STATUS |
-          | 产物上传模式 | $ARTIFACT_UPLOAD_MODE |
+          | 产物上传模式 | $UPLOAD_MODE_STATUS |
 
           ### 下载说明
 
@@ -605,6 +615,23 @@ jobs:
         with:
           path: ./downloaded-artifacts
 
+      # ==================== 校验关键产物 ====================
+      # AnyKernel3 刷入包是 Release 里最关键的产物，必须在创建 Release 之前确认存在，
+      # 否则会发布出一个没有可刷入 zip 的 Release
+      - name: 校验关键产物
+        run: |
+          zip_count=$(find ./downloaded-artifacts -type f -name '*AnyKernel3*.zip' | wc -l)
+          if [ "$zip_count" -eq 0 ]; then
+            echo "::error::未找到 AnyKernel3 刷入包 (*AnyKernel3*.zip)，已中止发布"
+            echo "::error::请确认构建时 artifact_upload_mode 为「上传全部」，build.yml 只在该模式下打包 zip"
+            echo "当前下载到的产物结构:"
+            find ./downloaded-artifacts -maxdepth 2 | head -60
+            exit 1
+          fi
+          echo "找到 $zip_count 个 AnyKernel3 刷入包:"
+          find ./downloaded-artifacts -type f -name '*AnyKernel3*.zip' | sed 's/^/  - /'
+          echo "- AnyKernel3 刷入包: $zip_count 个" >> $GITHUB_STEP_SUMMARY
+
       # ==================== 创建 GitHub Release ====================
       - name: 创建 GitHub Release
         run: |
@@ -646,6 +673,16 @@ jobs:
             [ -d "$file" ] && continue
             # 跳过补丁冲突汇总目录
             [[ "$file" == *-Rejects/* ]] && continue
+            # 只发布可刷入的 zip、镜像与构建日志，
+            # 避免把 AnyKernel3 目录里的 anykernel.sh / banner / LICENSE 等零散文件传上去
+            case "$file" in
+              *.zip|*.img) ;;
+              *-Build-Logs/*) ;;
+              *)
+                echo "跳过非发布产物: $file"
+                continue
+                ;;
+            esac
             echo "上传 $file..."
             gh release upload "$NEW_TAG" "$file" --clobber
             uploaded=$((uploaded + 1))
