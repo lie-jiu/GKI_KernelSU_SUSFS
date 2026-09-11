@@ -153,6 +153,30 @@ fix_statfs_forward_declaration() {
 }
 fix_statfs_forward_declaration
 
+# SUSFS v2.3.0 的 fs/susfs.c 在 statfs 钩子里调用了 security_sb_statfs()，
+# 但该文件没有 include <linux/security.h>，同样会触发
+# -Werror=implicit-function-declaration
+fix_susfs_security_header() {
+  local f="fs/susfs.c"
+  if [ ! -f "$f" ]; then
+    return 0
+  fi
+  if ! grep -q 'security_sb_statfs' "$f"; then
+    return 0
+  fi
+  if grep -q '^#include <linux/security.h>' "$f"; then
+    return 0
+  fi
+
+  echo "为 fs/susfs.c 补齐 security_sb_statfs() 所需的 <linux/security.h>"
+  sed -i '0,/^#include /s//#include <linux\/security.h>\n&/' "$f"
+  if ! grep -q '^#include <linux/security.h>' "$f"; then
+    echo "::error::无法为 fs/susfs.c 插入 <linux/security.h>"
+    exit 1
+  fi
+}
+fix_susfs_security_header
+
 # 为尚未提供 SU 会话 FD 接口的 SukiSU/ReSukiSU 恢复旧版 exec hook 行为
 EXEC_HELPER=""
 if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "ReSukiSU" ]]; then
