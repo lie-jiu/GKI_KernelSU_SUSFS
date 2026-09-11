@@ -117,6 +117,42 @@ fi
 
 patch -p1 < "$SUSFS_PATCH" || true
 
+# 修复 SUSFS 5.10 补丁的 statfs 前向声明顺序问题：
+# 补丁把 extern 声明放在 vfs_get_fsid() 之后，而调用这些函数的
+# susfs_statfs_by_dentry() 定义在更靠前的位置，clang 下会触发
+# -Werror=implicit-function-declaration（5.15/6.1 分支已把声明放在调用之前，不受影响）
+fix_statfs_forward_declaration() {
+  local f="fs/statfs.c"
+  if [ ! -f "$f" ]; then
+    return 0
+  fi
+  if ! grep -q 'susfs_sus_kstat_spoof_vfs_statfs' "$f"; then
+    return 0
+  fi
+
+  local call_line decl_line
+  call_line=$(grep -n 'static int susfs_statfs_by_dentry' "$f" | head -n 1 | cut -d: -f1)
+  decl_line=$(grep -n '^extern int susfs_sus_kstat_spoof_vfs_statfs' "$f" | head -n 1 | cut -d: -f1)
+  if [ -z "$call_line" ] || [ -z "$decl_line" ]; then
+    return 0
+  fi
+  if [ "$decl_line" -lt "$call_line" ]; then
+    return 0
+  fi
+
+  echo "修复 SUSFS statfs 前向声明顺序（调用点行 ${call_line} 早于声明行 ${decl_line}）"
+  perl -0pi -e 's{(^#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nstatic int susfs_statfs_by_dentry)}{#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\nextern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);\nextern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n$1}ms' "$f"
+
+  # 校验：调用点之前必须已能见到声明
+  call_line=$(grep -n 'static int susfs_statfs_by_dentry' "$f" | head -n 1 | cut -d: -f1)
+  decl_line=$(grep -n '^extern int susfs_sus_kstat_spoof_vfs_statfs' "$f" | head -n 1 | cut -d: -f1)
+  if [ -z "$decl_line" ] || [ "$decl_line" -gt "$call_line" ]; then
+    echo "::error::无法为 fs/statfs.c 插入 SUSFS statfs 前向声明"
+    exit 1
+  fi
+}
+fix_statfs_forward_declaration
+
 # 为尚未提供 SU 会话 FD 接口的 SukiSU/ReSukiSU 恢复旧版 exec hook 行为
 EXEC_HELPER=""
 if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "ReSukiSU" ]]; then
